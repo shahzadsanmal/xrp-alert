@@ -1,0 +1,554 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Write app source
+        run: |
+          cat > settings.gradle.kts <<'XRPEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "XrpAlert"
+          include(":app")
+          XRPEOF
+          cat > build.gradle.kts <<'XRPEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          XRPEOF
+          cat > gradle.properties <<'XRPEOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          kotlin.code.style=official
+          XRPEOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'XRPEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.sanmal.xrpalert"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.sanmal.xrpalert"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              lint {
+                  abortOnError = false
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.work:work-runtime-ktx:2.9.1")
+          }
+          XRPEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'XRPEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_lock_idle_alarm"
+                  android:label="XRP Alert"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          XRPEOF
+          mkdir -p app/src/main/java/com/sanmal/xrpalert
+          cat > app/src/main/java/com/sanmal/xrpalert/PriceChecker.kt <<'XRPEOF'
+          package com.sanmal.xrpalert
+
+          import org.json.JSONArray
+          import java.io.IOException
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import kotlin.math.max
+          import kotlin.math.min
+
+          /** Price movement of XRP/USDT over the last few hours. */
+          data class Move(
+              val price: Double,   // latest price
+              val low: Double,     // lowest price in the window
+              val high: Double,    // highest price in the window
+              val upPct: Double,   // % the price has risen from the window's low
+              val downPct: Double  // % the price has fallen from the window's high
+          )
+
+          object PriceChecker {
+              // Binance public market data (no account or API key needed). Second host is a backup mirror.
+              private val hosts = listOf("https://api.binance.com", "https://data-api.binance.vision")
+
+              /** Fetches 15-minute candles covering the last [hours] hours and measures the move. */
+              fun fetch(hours: Int): Move {
+                  val limit = hours * 4 + 1
+                  var lastError: Exception? = null
+                  for (host in hosts) {
+                      try {
+                          return parse(get("$host/api/v3/klines?symbol=XRPUSDT&interval=15m&limit=$limit"))
+                      } catch (e: Exception) {
+                          lastError = e
+                      }
+                  }
+                  throw lastError ?: IOException("No price data")
+              }
+
+              private fun get(url: String): String {
+                  val conn = URL(url).openConnection() as HttpURLConnection
+                  conn.connectTimeout = 10_000
+                  conn.readTimeout = 10_000
+                  try {
+                      if (conn.responseCode != 200) throw IOException("HTTP ${conn.responseCode}")
+                      return conn.inputStream.bufferedReader().use { it.readText() }
+                  } finally {
+                      conn.disconnect()
+                  }
+              }
+
+              private fun parse(body: String): Move {
+                  val candles = JSONArray(body)
+                  if (candles.length() == 0) throw IOException("Empty price data")
+                  var low = Double.MAX_VALUE
+                  var high = 0.0
+                  for (i in 0 until candles.length()) {
+                      val k = candles.getJSONArray(i) // [openTime, open, high, low, close, ...]
+                      high = max(high, k.getString(2).toDouble())
+                      low = min(low, k.getString(3).toDouble())
+                  }
+                  val price = candles.getJSONArray(candles.length() - 1).getString(4).toDouble()
+                  return Move(
+                      price = price,
+                      low = low,
+                      high = high,
+                      upPct = (price - low) / low * 100.0,
+                      downPct = (high - price) / high * 100.0
+                  )
+              }
+          }
+          XRPEOF
+          mkdir -p app/src/main/java/com/sanmal/xrpalert
+          cat > app/src/main/java/com/sanmal/xrpalert/Prefs.kt <<'XRPEOF'
+          package com.sanmal.xrpalert
+
+          import android.content.Context
+
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("xrp_alert", Context.MODE_PRIVATE)
+
+              fun threshold(c: Context): Float = sp(c).getFloat("threshold", 5f)
+              fun hours(c: Context): Int = sp(c).getInt("hours", 4)
+              fun enabled(c: Context): Boolean = sp(c).getBoolean("enabled", false)
+
+              fun save(c: Context, threshold: Float, hours: Int, enabled: Boolean) {
+                  sp(c).edit()
+                      .putFloat("threshold", threshold)
+                      .putInt("hours", hours)
+                      .putBoolean("enabled", enabled)
+                      .apply()
+              }
+
+              fun lastAlert(c: Context, direction: String): Long = sp(c).getLong("last_$direction", 0L)
+              fun setLastAlert(c: Context, direction: String, time: Long) {
+                  sp(c).edit().putLong("last_$direction", time).apply()
+              }
+          }
+          XRPEOF
+          mkdir -p app/src/main/java/com/sanmal/xrpalert
+          cat > app/src/main/java/com/sanmal/xrpalert/Notifier.kt <<'XRPEOF'
+          package com.sanmal.xrpalert
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.AudioAttributes
+          import android.media.RingtoneManager
+          import android.os.Build
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.NotificationManagerCompat
+          import java.util.Locale
+
+          object Notifier {
+              private const val CHANNEL = "xrp_alerts_v1"
+
+              fun createChannel(c: Context) {
+                  val channel = NotificationChannel(
+                      CHANNEL, "XRP price alerts", NotificationManager.IMPORTANCE_HIGH
+                  ).apply {
+                      description = "Alarm when XRP moves sharply up or down"
+                      enableVibration(true)
+                      vibrationPattern = longArrayOf(0, 600, 300, 600, 300, 600)
+                      setSound(
+                          RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM),
+                          AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_ALARM)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                              .build()
+                      )
+                  }
+                  c.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+              }
+
+              fun canNotify(c: Context): Boolean =
+                  Build.VERSION.SDK_INT < 33 ||
+                      c.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
+              @SuppressLint("MissingPermission")
+              fun alert(c: Context, up: Boolean, m: Move, hours: Int, test: Boolean = false) {
+                  createChannel(c)
+                  if (!canNotify(c)) return
+
+                  val pct = if (up) m.upPct else m.downPct
+                  val arrow = if (up) "▲ UP" else "▼ DOWN"
+                  val title = (if (test) "[Test] " else "") +
+                      String.format(Locale.US, "XRP %s %.1f%% in %dh", arrow, pct, hours)
+                  val text = String.format(
+                      Locale.US, "Now \$%.4f  ·  %dh low \$%.4f  ·  %dh high \$%.4f",
+                      m.price, hours, m.low, hours, m.high
+                  )
+
+                  val open = PendingIntent.getActivity(
+                      c, 0, Intent(c, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+
+                  val n = NotificationCompat.Builder(c, CHANNEL)
+                      .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                      .setContentTitle(title)
+                      .setContentText(text)
+                      .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setCategory(NotificationCompat.CATEGORY_ALARM)
+                      .setAutoCancel(true)
+                      .setContentIntent(open)
+                      .build()
+
+                  NotificationManagerCompat.from(c).notify(if (up) 1 else 2, n)
+              }
+          }
+          XRPEOF
+          mkdir -p app/src/main/java/com/sanmal/xrpalert
+          cat > app/src/main/java/com/sanmal/xrpalert/AlertWorker.kt <<'XRPEOF'
+          package com.sanmal.xrpalert
+
+          import android.content.Context
+          import androidx.work.Constraints
+          import androidx.work.CoroutineWorker
+          import androidx.work.ExistingPeriodicWorkPolicy
+          import androidx.work.NetworkType
+          import androidx.work.PeriodicWorkRequestBuilder
+          import androidx.work.WorkManager
+          import androidx.work.WorkerParameters
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.util.concurrent.TimeUnit
+
+          /** Runs in the background about every 15 minutes, even when the app is closed. */
+          class AlertWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
+
+              override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+                  val c = applicationContext
+                  if (!Prefs.enabled(c)) return@withContext Result.success()
+
+                  val threshold = Prefs.threshold(c)
+                  val hours = Prefs.hours(c)
+                  val move = try {
+                      PriceChecker.fetch(hours)
+                  } catch (e: Exception) {
+                      return@withContext Result.retry()
+                  }
+
+                  // Don't repeat the same alert direction more than once per window.
+                  val now = System.currentTimeMillis()
+                  val cooldown = hours * 60L * 60L * 1000L
+
+                  if (move.upPct >= threshold && now - Prefs.lastAlert(c, "up") > cooldown) {
+                      Notifier.alert(c, up = true, m = move, hours = hours)
+                      Prefs.setLastAlert(c, "up", now)
+                  }
+                  if (move.downPct >= threshold && now - Prefs.lastAlert(c, "down") > cooldown) {
+                      Notifier.alert(c, up = false, m = move, hours = hours)
+                      Prefs.setLastAlert(c, "down", now)
+                  }
+                  Result.success()
+              }
+
+              companion object {
+                  private const val NAME = "xrp_watch"
+
+                  fun start(c: Context) {
+                      val request = PeriodicWorkRequestBuilder<AlertWorker>(15, TimeUnit.MINUTES)
+                          .setConstraints(
+                              Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+                          )
+                          .build()
+                      WorkManager.getInstance(c)
+                          .enqueueUniquePeriodicWork(NAME, ExistingPeriodicWorkPolicy.UPDATE, request)
+                  }
+
+                  fun stop(c: Context) {
+                      WorkManager.getInstance(c).cancelUniqueWork(NAME)
+                  }
+              }
+          }
+          XRPEOF
+          mkdir -p app/src/main/java/com/sanmal/xrpalert
+          cat > app/src/main/java/com/sanmal/xrpalert/MainActivity.kt <<'XRPEOF'
+          package com.sanmal.xrpalert
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.util.Locale
+
+          class MainActivity : Activity() {
+
+              private lateinit var thresholdInput: EditText
+              private lateinit var hoursInput: EditText
+              private lateinit var toggleButton: Button
+              private lateinit var statusText: TextView
+              private val main = Handler(Looper.getMainLooper())
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Notifier.createChannel(this)
+                  if (!Notifier.canNotify(this) && Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  setContentView(buildUi())
+                  refreshToggle()
+                  checkNow()
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun buildUi(): ScrollView {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(20), dp(20), dp(20))
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "XRP Move Alarm"
+                      textSize = 24f
+                  })
+                  root.addView(TextView(this).apply {
+                      text = "Rings an alarm when XRP rises or falls by your chosen % within your chosen number of hours. Checks about every 15 minutes, even when the app is closed."
+                      textSize = 14f
+                      setPadding(0, dp(6), 0, dp(16))
+                  })
+
+                  root.addView(label("Alert when XRP moves at least (%)"))
+                  thresholdInput = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                      setText(trim(Prefs.threshold(this@MainActivity)))
+                  }
+                  root.addView(thresholdInput)
+
+                  root.addView(label("Within the last (hours)"))
+                  hoursInput = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setText(Prefs.hours(this@MainActivity).toString())
+                  }
+                  root.addView(hoursInput)
+
+                  toggleButton = button("") { toggle() }
+                  root.addView(toggleButton)
+                  root.addView(button("Check price now") { checkNow() })
+                  root.addView(button("Test alarm sound") { testAlarm() })
+                  root.addView(button("Keep running in background (battery setting)") { askBatteryExemption() })
+
+                  statusText = TextView(this).apply {
+                      textSize = 15f
+                      setPadding(0, dp(16), 0, 0)
+                  }
+                  root.addView(statusText)
+
+                  return ScrollView(this).apply { addView(root, MATCH_PARENT, WRAP_CONTENT) }
+              }
+
+              private fun label(t: String) = TextView(this).apply {
+                  text = t
+                  textSize = 14f
+                  setPadding(0, dp(8), 0, 0)
+              }
+
+              private fun button(t: String, onClick: () -> Unit) = Button(this).apply {
+                  text = t
+                  setOnClickListener { onClick() }
+                  layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8) }
+              }
+
+              private fun trim(f: Float) = if (f % 1f == 0f) f.toInt().toString() else f.toString()
+
+              /** Reads and validates the two inputs; returns null (and shows a message) if invalid. */
+              private fun readSettings(): Pair<Float, Int>? {
+                  val t = thresholdInput.text.toString().toFloatOrNull()
+                  val h = hoursInput.text.toString().toIntOrNull()
+                  if (t == null || t < 0.5f || t > 50f) {
+                      toast("Enter a % between 0.5 and 50"); return null
+                  }
+                  if (h == null || h < 1 || h > 24) {
+                      toast("Enter hours between 1 and 24"); return null
+                  }
+                  return t to h
+              }
+
+              private fun toggle() {
+                  val (t, h) = readSettings() ?: return
+                  val enable = !Prefs.enabled(this)
+                  Prefs.save(this, t, h, enable)
+                  if (enable) {
+                      AlertWorker.start(this)
+                      toast("Alarm ON: ±${trim(t)}% within ${h}h")
+                  } else {
+                      AlertWorker.stop(this)
+                      toast("Alarm OFF")
+                  }
+                  refreshToggle()
+                  checkNow()
+              }
+
+              private fun refreshToggle() {
+                  toggleButton.text = if (Prefs.enabled(this)) "■  Stop alarm (currently ON)" else "▶  Start alarm (currently OFF)"
+              }
+
+              private fun checkNow() {
+                  val h = hoursInput.text.toString().toIntOrNull()?.coerceIn(1, 24) ?: Prefs.hours(this)
+                  statusText.text = "Checking XRP price…"
+                  Thread {
+                      val msg = try {
+                          val m = PriceChecker.fetch(h)
+                          String.format(
+                              Locale.US,
+                              "XRP price: \$%.4f\n\nLast %dh low: \$%.4f   (now %.2f%% above)\nLast %dh high: \$%.4f   (now %.2f%% below)\n\nAlarm: %s",
+                              m.price, h, m.low, m.upPct, h, m.high, m.downPct,
+                              if (Prefs.enabled(this)) "ON" else "OFF"
+                          )
+                      } catch (e: Exception) {
+                          "Couldn't get the price: ${e.message ?: "network error"}.\nCheck your internet connection."
+                      }
+                      main.post { statusText.text = msg }
+                  }.start()
+              }
+
+              private fun testAlarm() {
+                  if (!Notifier.canNotify(this)) {
+                      toast("Allow notifications for XRP Alert first")
+                      if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                      return
+                  }
+                  val h = Prefs.hours(this)
+                  Notifier.alert(this, up = true, m = Move(0.6, 0.57, 0.6, 5.3, 0.0), hours = h, test = true)
+              }
+
+              private fun askBatteryExemption() {
+                  val pm = getSystemService(PowerManager::class.java)
+                  if (pm.isIgnoringBatteryOptimizations(packageName)) {
+                      toast("Already allowed to run in background")
+                      return
+                  }
+                  try {
+                      startActivity(
+                          Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+                      )
+                  } catch (e: Exception) {
+                      startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }
+              }
+
+              private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+          }
+          XRPEOF
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk XRP-Alert.apk
+
+      - name: Publish APK as a download
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: XRP Alert build ${{ github.run_number }}
+          files: XRP-Alert.apk
